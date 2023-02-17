@@ -27,24 +27,33 @@
 # OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
 # ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import os
+
 import argparse
 import random
 import shutil
 import sys
 
 import math
+
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
+from torch.autograd import Variable
 
 from torch.utils.data import DataLoader
 from torchvision import transforms
-
+import torchvision
 import compressai
 
 from compressai.datasets import ImageFolder
 from compressai.zoo import image_models
-from netext import ScaleHyperpriorExt
+from netext import ScaleHyperpriorWithY, ScaleHyperpriorYDecoder, Discriminator, MeanScaleHyperpriorWithY
+
+SJOB = os.getenv('SLURM_JOB_ID')
 
 class CropToMod(object):
     def __init__(self, mod):
@@ -104,112 +113,49 @@ class CustomDataParallel(nn.DataParallel):
             return getattr(self.module, key)
 
 
-def configure_optimizers(net, args):
-    """Separate parameters for the main optimizer and the auxiliary optimizer.
-    Return two optimizers"""
-
-    parameters = {
-        n
-        for n, p in net.named_parameters()
-        if not n.endswith(".quantiles") and p.requires_grad
-    }
-    aux_parameters = {
-        n
-        for n, p in net.named_parameters()
-        if n.endswith(".quantiles") and p.requires_grad
-    }
-
-    # Make sure we don't have an intersection of parameters
-    params_dict = dict(net.named_parameters())
-    inter_params = parameters & aux_parameters
-    union_params = parameters | aux_parameters
-
-    assert len(inter_params) == 0
-    assert len(union_params) - len(params_dict.keys()) == 0
-
-    optimizer = optim.Adam(
-        (params_dict[n] for n in sorted(parameters)),
-        lr=args.learning_rate,
-    )
-    aux_optimizer = optim.Adam(
-        (params_dict[n] for n in sorted(aux_parameters)),
-        lr=args.aux_learning_rate,
-    )
-    return optimizer, aux_optimizer
-
-
-def train_one_epoch(
-    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm
-):
-    model.train()
-    device = next(model.parameters()).device
-
-    for i, d in enumerate(train_dataloader):
-        d = d.to(device)
-
-        optimizer.zero_grad()
-        aux_optimizer.zero_grad()
-
-        out_net = model(d)
-
-        out_criterion = criterion(out_net, d)
-        out_criterion["loss"].backward()
-        if clip_max_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
-        optimizer.step()
-
-        aux_loss = model.aux_loss()
-        aux_loss.backward()
-        aux_optimizer.step()
-
-        if i % 500 == 0:
-            print(
-                f"Train epoch {epoch}: ["
-                f"{i*len(d)}/{len(train_dataloader.dataset)}"
-                f" ({100. * i / len(train_dataloader):.0f}%)]"
-                f'\tLoss: {out_criterion["loss"].item():.3f} |'
-                f'\tMSE loss: {out_criterion["mse_loss"].item():.3f} |'
-                f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
-                f"\tAux loss: {aux_loss.item():.2f}"
-            )
-
-
-def test_epoch(epoch, test_dataloader, model, criterion):
-    model.eval()
-    device = next(model.parameters()).device
+def test_epoch(epoch, test_dataloader, G1, G2, criterion, img_dir):
+    G1.eval()
+    G2.eval()
+    device = next(G1.parameters()).device
 
     loss = AverageMeter()
     bpp_loss = AverageMeter()
     mse_loss = AverageMeter()
     aux_loss = AverageMeter()
+    mse2_loss = AverageMeter()
 
     with torch.no_grad():
-        for d in test_dataloader:
-            d = d.to(device)
-            out_net = model(d)
-            out_criterion = criterion(out_net, d)
+        for xi, x_ in enumerate(test_dataloader):
+            x_ = x_.to(device)
+            out_net = G1(x_)
+            out_criterion = criterion(out_net, x_)
+            G_result = G2(out_net["y_hat_i"])
+            g2_mse = torch.mean((G_result.data - x_)**2)
 
-            aux_loss.update(model.aux_loss())
+            aux_loss.update(G1.aux_loss())
             bpp_loss.update(out_criterion["bpp_loss"])
             loss.update(out_criterion["loss"])
             mse_loss.update(out_criterion["mse_loss"])
+            mse2_loss.update(g2_mse)
+            if xi<=10 and img_dir != "":
+                with open(img_dir + "/{}_o.jpg".format(xi), 'wb') as f:
+                    torchvision.utils.save_image(x_[0], f)
+                with open(img_dir + "/{}_g1.jpg".format(xi), 'wb') as f:
+                    torchvision.utils.save_image(out_net["x_hat"][0], f)
+                with open(img_dir + "/{}_g2.jpg".format(xi), 'wb') as f:
+                    torchvision.utils.save_image(G_result[0], f)
 
     print(
         f"Test epoch {epoch}: Average losses:"
         f"\tLoss: {loss.avg:.3f} |"
-        f"\tMSE loss: {mse_loss.avg:.3f} |"
-        f"\tBpp loss: {bpp_loss.avg:.2f} |"
+        f"\tMSEG1 loss: {mse_loss.avg:.4f} |"
+        f"\tMSEG2 loss: {mse2_loss.avg:.4f} |"
+        f"\tBpp loss: {bpp_loss.avg:.4f} |"
         f"\tPSNR val: {10.0*torch.log10(1/mse_loss.avg):.2f} |"
         f"\tAux loss: {aux_loss.avg:.2f}\n"
     )
 
     return loss.avg
-
-
-def save_checkpoint(state, is_best, filename="checkpoint.pth.tar"):
-    torch.save(state, filename)
-    if is_best:
-        shutil.copyfile(filename, "checkpoint_best_loss.pth.tar")
 
 
 def parse_args(argv):
@@ -292,32 +238,20 @@ def parse_args(argv):
 
 
 def main(argv):
+    N, M = 128, 192
     args = parse_args(argv)
 
     if args.seed is not None:
         torch.manual_seed(args.seed)
         random.seed(args.seed)
 
-    train_transforms = transforms.Compose(
-        [transforms.RandomCrop(args.patch_size,pad_if_needed=True), transforms.ToTensor()]
-    )
-
     test_transforms = transforms.Compose(
         [CropToMod(64), transforms.ToTensor()]
     )
 
-    train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
     test_dataset = ImageFolder(args.dataset, split="test", transform=test_transforms)
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
-
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        shuffle=True,
-        pin_memory=(device == "cuda"),
-    )
 
     test_dataloader = DataLoader(
         test_dataset,
@@ -327,58 +261,32 @@ def main(argv):
         pin_memory=(device == "cuda"),
     )
 
-    net = image_models[args.model](quality=1,pretrained=True)
-    # net = ScaleHyperpriorExt()
-    net = net.to(device)
+    G1 = MeanScaleHyperpriorWithY(N,M)
+    G2 = ScaleHyperpriorYDecoder(N,M)
+    D = Discriminator((3,256,256),(M,16,16),M)
+    G1 = G1.to(device)
+    G2 = G2.to(device)
+    D = D.to(device)
 
     if args.cuda and torch.cuda.device_count() > 1:
-        net = CustomDataParallel(net)
+        G1 = CustomDataParallel(G1)
+        G2 = CustomDataParallel(G2)
+        D = CustomDataParallel(D)
 
-    optimizer, aux_optimizer = configure_optimizers(net, args)
-    lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min")
     criterion = RateDistortionLoss(lmbda=args.lmbda)
 
     last_epoch = 0
-    if args.checkpoint:  # load from previous checkpoint
-        print("Loading", args.checkpoint)
-        checkpoint = torch.load(args.checkpoint, map_location=device)
-        last_epoch = checkpoint["epoch"] + 1
-        net.load_state_dict(checkpoint["state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
-        lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+    print("Loading", args.checkpoint)
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    last_epoch = checkpoint["epoch"] + 1
+    G1.load_state_dict(checkpoint["G1_state_dict"])
+    G2.load_state_dict(checkpoint["G2_state_dict"])
+    D.load_state_dict(checkpoint["D_state_dict"])
+    img_dir = args.checkpoint[:-4]+"_imgs"
+    if not os.path.exists(img_dir):
+        os.makedirs(img_dir)
 
-    best_loss = float("inf")
-    for epoch in range(last_epoch, args.epochs):
-        print(f"Learning rate: {optimizer.param_groups[0]['lr']}")
-        train_one_epoch(
-            net,
-            criterion,
-            train_dataloader,
-            optimizer,
-            aux_optimizer,
-            epoch,
-            args.clip_max_norm,
-        )
-        loss = test_epoch(epoch, test_dataloader, net, criterion)
-        lr_scheduler.step(loss)
-
-        is_best = loss < best_loss
-        best_loss = min(loss, best_loss)
-
-        if args.save:
-            save_checkpoint(
-                {
-                    "epoch": epoch,
-                    "state_dict": net.state_dict(),
-                    "loss": loss,
-                    "optimizer": optimizer.state_dict(),
-                    "aux_optimizer": aux_optimizer.state_dict(),
-                    "lr_scheduler": lr_scheduler.state_dict(),
-                },
-                is_best,
-            )
-        
+    test_epoch(last_epoch, test_dataloader, G1, G2, criterion, img_dir)
 
 if __name__ == "__main__":
     main(sys.argv[1:])

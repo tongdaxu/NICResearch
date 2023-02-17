@@ -27,16 +27,23 @@
 # OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
 # ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import os
+
 import argparse
 import random
 import shutil
 import sys
 
 import math
+
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
+import torch.nn.functional as F
+from torch.autograd import Variable
+import torchvision
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
@@ -44,7 +51,9 @@ import compressai
 
 from compressai.datasets import ImageFolder
 from compressai.zoo import image_models
-from netext import ScaleHyperpriorExt
+from netext import ScaleHyperpriorWithY, ScaleHyperpriorYDecoder, Discriminator, MeanScaleHyperpriorWithY
+from srresnet import _NetG, _NetD
+SJOB = os.getenv('SLURM_JOB_ID')
 
 class CropToMod(object):
     def __init__(self, mod):
@@ -139,66 +148,135 @@ def configure_optimizers(net, args):
 
 
 def train_one_epoch(
-    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm
+    G1, G2, D, criterion, train_dataloader, G1_optimizer, G1_aux_optimizer, 
+    G2_optimizer, D_optimizer, epoch, clip_max_norm
 ):
-    model.train()
-    device = next(model.parameters()).device
-
-    for i, d in enumerate(train_dataloader):
-        d = d.to(device)
-
-        optimizer.zero_grad()
-        aux_optimizer.zero_grad()
-
-        out_net = model(d)
-
-        out_criterion = criterion(out_net, d)
-        out_criterion["loss"].backward()
+    G1.train()
+    G2.train()
+    D.train()
+    device = next(G1.parameters()).device
+    lambda_gp = 10
+    lambda_l2 = 0.005
+    for i, x_ in enumerate(train_dataloader):
+        x_ = x_.to(device)
+        mini_batch = x_.size()[0]
+        # update rate distortion auto encoder
+        G1_optimizer.zero_grad()
+        G1_aux_optimizer.zero_grad()
+        G1_out = G1(x_)
+        G1_out_criterion = criterion(G1_out, x_)
+        G1_out_criterion["loss"].backward()
         if clip_max_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
-        optimizer.step()
+            torch.nn.utils.clip_grad_norm_(G1.parameters(), clip_max_norm)
+        G1_optimizer.step()
+        G1_aux_loss = G1.aux_loss()
+        G1_aux_loss.backward()
+        G1_aux_optimizer.step()
 
-        aux_loss = model.aux_loss()
-        aux_loss.backward()
-        aux_optimizer.step()
+        D.zero_grad()
+        # real image
+        D_result = D(x_, G1_out["x_hat"].detach()).squeeze()
+        D_real_loss = -D_result.mean()
+
+        G_result = G2(G1_out["y_hat_i"])
+        D_result = D(G_result.data, G1_out["x_hat"].detach()).squeeze()
+        D_fake_loss = D_result.mean()
+        D_train_loss = D_real_loss + D_fake_loss
+
+        D_train_loss.backward()
+        D_optimizer.step()
+
+        D.zero_grad()
+        alpha = torch.rand(x_.size(0), 1, 1, 1)
+        alpha1 = alpha.cuda().expand_as(x_)
+        interpolated1 = Variable(alpha1 * x_.data + (1 - alpha1) * G_result.data, requires_grad=True)
+        interpolated2 = Variable(G1_out["x_hat"].detach(), requires_grad=True)
+
+        out = D(interpolated1, interpolated2).squeeze()
+
+        grad = torch.autograd.grad(outputs=out,
+                                    # inputs=[interpolated1, interpolated2],
+                                    inputs=interpolated1,
+                                    grad_outputs=torch.ones(out.size()).cuda(),
+                                    retain_graph=True,
+                                    create_graph=True,
+                                    only_inputs=True)[0]
+
+        grad = grad.view(grad.size(0), -1)
+        grad_l2norm = torch.sqrt(torch.sum(grad ** 2, dim=1))
+        d_loss_gp = torch.mean((grad_l2norm - 1) ** 2)
+
+        # Backward + Optimize
+        gp_loss = lambda_gp * d_loss_gp
+        gp_loss.backward()
+        D_optimizer.step()
+
+        # train G2
+        D.zero_grad()
+        G2.zero_grad()
+
+        G_result = G2(G1_out["y_hat_i"])
+        D_result = D(G_result, G1_out["x_hat"].detach()).squeeze()
+
+        G2_l2norm = lambda_l2 * F.mse_loss(G1_out["x_hat"].detach(), G_result) 
+        G_train_loss = - D_result.mean() + G2_l2norm
+
+        G_train_loss.backward()
+        G2_optimizer.step()
+
+        g2_mse = torch.mean((G_result.data - x_)**2)
 
         if i % 500 == 0:
             print(
                 f"Train epoch {epoch}: ["
-                f"{i*len(d)}/{len(train_dataloader.dataset)}"
+                f"{i*len(x_)}/{len(train_dataloader.dataset)}"
                 f" ({100. * i / len(train_dataloader):.0f}%)]"
-                f'\tLoss: {out_criterion["loss"].item():.3f} |'
-                f'\tMSE loss: {out_criterion["mse_loss"].item():.3f} |'
-                f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
-                f"\tAux loss: {aux_loss.item():.2f}"
+                f'\tG1 Loss: {G1_out_criterion["loss"].item():.4f} |'
+                f'\tG1 MSE loss: {G1_out_criterion["mse_loss"].item():.4f} |'
+                f'\tG1 Bpp loss: {G1_out_criterion["bpp_loss"].item():.4f} |'
+                f"\tG1 Aux loss: {G1_aux_loss.item():.2f} |"
+                f"\tD loss: {D_train_loss.item():.2f} |"
+                f"\tG2 MSE loss: {g2_mse.item():.4f} |"
             )
 
-
-def test_epoch(epoch, test_dataloader, model, criterion):
-    model.eval()
-    device = next(model.parameters()).device
+def test_epoch(epoch, test_dataloader, G1, G2, criterion, img_dir):
+    G1.eval()
+    G2.eval()
+    device = next(G1.parameters()).device
 
     loss = AverageMeter()
     bpp_loss = AverageMeter()
     mse_loss = AverageMeter()
     aux_loss = AverageMeter()
+    mse2_loss = AverageMeter()
 
     with torch.no_grad():
-        for d in test_dataloader:
-            d = d.to(device)
-            out_net = model(d)
-            out_criterion = criterion(out_net, d)
+        for xi, x_ in enumerate(test_dataloader):
+            x_ = x_.to(device)
+            out_net = G1(x_)
+            out_criterion = criterion(out_net, x_)
+            G_result = G2(out_net["y_hat_i"])
+            g2_mse = torch.mean((G_result.data - x_)**2)
 
-            aux_loss.update(model.aux_loss())
+            aux_loss.update(G1.aux_loss())
             bpp_loss.update(out_criterion["bpp_loss"])
             loss.update(out_criterion["loss"])
             mse_loss.update(out_criterion["mse_loss"])
+            mse2_loss.update(g2_mse)
+            if xi<=10 and img_dir != "":
+                with open(img_dir + "/{}_o.jpg".format(xi), 'wb') as f:
+                    torchvision.utils.save_image(x_[0], f)
+                with open(img_dir + "/{}_g1.jpg".format(xi), 'wb') as f:
+                    torchvision.utils.save_image(out_net["x_hat"][0], f)
+                with open(img_dir + "/{}_g2.jpg".format(xi), 'wb') as f:
+                    torchvision.utils.save_image(G_result[0], f)
 
     print(
         f"Test epoch {epoch}: Average losses:"
         f"\tLoss: {loss.avg:.3f} |"
-        f"\tMSE loss: {mse_loss.avg:.3f} |"
-        f"\tBpp loss: {bpp_loss.avg:.2f} |"
+        f"\tMSEG1 loss: {mse_loss.avg:.4f} |"
+        f"\tMSEG2 loss: {mse2_loss.avg:.4f} |"
+        f"\tBpp loss: {bpp_loss.avg:.4f} |"
         f"\tPSNR val: {10.0*torch.log10(1/mse_loss.avg):.2f} |"
         f"\tAux loss: {aux_loss.avg:.2f}\n"
     )
@@ -270,7 +348,7 @@ def parse_args(argv):
         "--patch-size",
         type=int,
         nargs=2,
-        default=(256, 256),
+        default=(128, 128),
         help="Size of the patches to be cropped (default: %(default)s)",
     )
     parser.add_argument("--cuda", action="store_true", help="Use cuda")
@@ -292,6 +370,7 @@ def parse_args(argv):
 
 
 def main(argv):
+    N, M = 128, 192
     args = parse_args(argv)
 
     if args.seed is not None:
@@ -327,15 +406,24 @@ def main(argv):
         pin_memory=(device == "cuda"),
     )
 
-    net = image_models[args.model](quality=1,pretrained=True)
-    # net = ScaleHyperpriorExt()
-    net = net.to(device)
+    G1 = MeanScaleHyperpriorWithY(N,M)
+    # G2 = ScaleHyperpriorYDecoder(N,M)
+    G2 = _NetG() 
+    # D = Discriminator((3,256,256),(M,16,16),M)
+    D = _NetD()
+    G1 = G1.to(device)
+    G2 = G2.to(device)
+    D = D.to(device)
 
     if args.cuda and torch.cuda.device_count() > 1:
-        net = CustomDataParallel(net)
+        G1 = CustomDataParallel(G1)
+        G2 = CustomDataParallel(G2)
+        D = CustomDataParallel(D)
 
-    optimizer, aux_optimizer = configure_optimizers(net, args)
-    lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min")
+    G1_optimizer, G1_aux_optimizer = configure_optimizers(G1, args)
+    G2_optimizer = optim.RMSprop(G2.parameters(), lr=args.learning_rate)
+    D_optimizer = optim.RMSprop(D.parameters(), lr=args.learning_rate*2)
+    lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(G1_optimizer, "min")
     criterion = RateDistortionLoss(lmbda=args.lmbda)
 
     last_epoch = 0
@@ -343,42 +431,42 @@ def main(argv):
         print("Loading", args.checkpoint)
         checkpoint = torch.load(args.checkpoint, map_location=device)
         last_epoch = checkpoint["epoch"] + 1
-        net.load_state_dict(checkpoint["state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
+        G1.load_state_dict(checkpoint["G1_state_dict"])
+        G2.load_state_dict(checkpoint["G2_state_dict"])
+        D.load_state_dict(checkpoint["D_state_dict"])
+        G1_optimizer.load_state_dict(checkpoint["G1_optimizer"])
+        G1_aux_optimizer.load_state_dict(checkpoint["G1_aux_optimizer"])
+        G2_optimizer.load_state_dict(checkpoint["G2_optimizer"])
+        D_optimizer.load_state_dict(checkpoint["D_optimizer"])
         lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
 
-    best_loss = float("inf")
+    if not os.path.exists(SJOB):
+        os.makedirs(SJOB)
+
     for epoch in range(last_epoch, args.epochs):
-        print(f"Learning rate: {optimizer.param_groups[0]['lr']}")
-        train_one_epoch(
-            net,
-            criterion,
-            train_dataloader,
-            optimizer,
-            aux_optimizer,
-            epoch,
-            args.clip_max_norm,
-        )
-        loss = test_epoch(epoch, test_dataloader, net, criterion)
-        lr_scheduler.step(loss)
-
-        is_best = loss < best_loss
-        best_loss = min(loss, best_loss)
-
-        if args.save:
-            save_checkpoint(
-                {
-                    "epoch": epoch,
-                    "state_dict": net.state_dict(),
-                    "loss": loss,
-                    "optimizer": optimizer.state_dict(),
-                    "aux_optimizer": aux_optimizer.state_dict(),
-                    "lr_scheduler": lr_scheduler.state_dict(),
-                },
-                is_best,
-            )
-        
+        print(f"Learning rate: {G1_optimizer.param_groups[0]['lr']}")
+        train_one_epoch(G1, G2, D, criterion, train_dataloader,
+            G1_optimizer, G1_aux_optimizer, G2_optimizer, D_optimizer,
+            epoch, args.clip_max_norm)
+        if epoch%10==0:
+            CKPT = SJOB + "/ckp_"+str(epoch)+".pth"
+            torch.save({
+                'epoch': epoch,
+                'G1_state_dict': G1.state_dict(),
+                'G2_state_dict': G2.state_dict(),
+                'D_state_dict': D.state_dict(),
+                'G1_optimizer': G1_optimizer.state_dict(),
+                'G1_aux_optimizer': G1_aux_optimizer.state_dict(),
+                'G2_optimizer': G2_optimizer.state_dict(),
+                'D_optimizer': D_optimizer.state_dict(),
+                'lr_scheduler':lr_scheduler.state_dict()
+            }, CKPT)
+            img_dir = CKPT + "_imgs"
+            if not os.path.exists(img_dir):
+                os.makedirs(img_dir)
+            test_epoch(epoch, test_dataloader, G1, G2, criterion, img_dir)
+        else:
+            test_epoch(epoch, test_dataloader, G1, G2, criterion, "")
 
 if __name__ == "__main__":
     main(sys.argv[1:])

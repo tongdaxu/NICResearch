@@ -45,6 +45,7 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 import torchvision
 from torch.utils.data import DataLoader
+from torchvision.datasets import Cityscapes
 from torchvision import transforms
 
 import compressai
@@ -157,7 +158,8 @@ def train_one_epoch(
     device = next(G1.parameters()).device
     lambda_gp = 10
     lambda_l2 = 0.005
-    for i, x_ in enumerate(train_dataloader):
+    for i, xx_ in enumerate(train_dataloader):
+        x_, xl_ = xx_
         x_ = x_.to(device)
         mini_batch = x_.size()[0]
         # update rate distortion auto encoder
@@ -251,7 +253,8 @@ def test_epoch(epoch, test_dataloader, G1, G2, criterion, img_dir):
     mse2_loss = AverageMeter()
 
     with torch.no_grad():
-        for xi, x_ in enumerate(test_dataloader):
+        for xi, xx_ in enumerate(test_dataloader):
+            x_, xl_ = xx_
             x_ = x_.to(device)
             out_net = G1(x_)
             out_criterion = criterion(out_net, x_)
@@ -378,15 +381,15 @@ def main(argv):
         random.seed(args.seed)
 
     train_transforms = transforms.Compose(
-        [transforms.RandomCrop(args.patch_size,pad_if_needed=True), transforms.ToTensor()]
+        [transforms.Resize(256), transforms.RandomCrop(args.patch_size,pad_if_needed=True), transforms.ToTensor()]
     )
 
     test_transforms = transforms.Compose(
-        [CropToMod(64), transforms.ToTensor()]
+        [transforms.Resize(256), CropToMod(64), transforms.ToTensor()]
     )
 
-    train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
-    test_dataset = ImageFolder(args.dataset, split="test", transform=test_transforms)
+    train_dataset = Cityscapes(args.dataset, split="train", target_type="semantic", transform=train_transforms, target_transform=train_transforms)
+    test_dataset = Cityscapes(args.dataset, split="val", target_type="semantic", transform=test_transforms, target_transform=test_transforms)
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
@@ -444,7 +447,6 @@ def main(argv):
         os.makedirs(SJOB)
 
     for epoch in range(last_epoch, args.epochs):
-        print(f"Learning rate: {G1_optimizer.param_groups[0]['lr']}")
         train_one_epoch(G1, G2, D, criterion, train_dataloader,
             G1_optimizer, G1_aux_optimizer, G2_optimizer, D_optimizer,
             epoch, args.clip_max_norm)
@@ -465,8 +467,8 @@ def main(argv):
             if not os.path.exists(img_dir):
                 os.makedirs(img_dir)
             test_epoch(epoch, test_dataloader, G1, G2, criterion, img_dir)
-        else:
-            test_epoch(epoch, test_dataloader, G1, G2, criterion, "")
+        # else:
+        #     test_epoch(epoch, test_dataloader, G1, G2, criterion, "")
 
 if __name__ == "__main__":
     main(sys.argv[1:])

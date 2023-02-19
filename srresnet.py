@@ -167,7 +167,7 @@ class SkipUpSample(nn.Module):
         return x
 
 class _NetG(nn.Module):
-    def __init__(self, deterministic=False, in_c=3, out_c=3, n_feat=80, scale_unetfeats=48, scale_orsnetfeats=32, num_cab=8, kernel_size=3, reduction=4, bias=False):
+    def __init__(self, deterministic=True, in_c=3, out_c=3, n_feat=80, scale_unetfeats=48, scale_orsnetfeats=32, num_cab=8, kernel_size=3, reduction=4, bias=False):
         super(_NetG, self).__init__()
 
         self.upsample = nn.ConvTranspose2d(192, 3, kernel_size=16, stride=16, bias=False)
@@ -187,7 +187,7 @@ class _NetG(nn.Module):
         H = up_img.size(2)
         W = up_img.size(3)
         if self.deterministic:
-            fea = self.shallow_feat1(up_img, eps)
+            fea = self.shallow_feat1(up_img)
         else:
             eps = torch.randn_like(up_img)
             fea = self.shallow_feat1(torch.cat([up_img, eps],dim=1))
@@ -198,12 +198,30 @@ class _NetG(nn.Module):
         return stage1_img
 
 
+class _ConNetG(nn.Module):
+    def __init__(self, in_c=34, out_c=3, n_feat=80, scale_unetfeats=48, scale_orsnetfeats=32, num_cab=8, kernel_size=3, reduction=4, bias=False):
+        super(_ConNetG, self).__init__()
+        act=nn.PReLU()
+        self.shallow_feat1 = nn.Sequential(conv(in_c*2, n_feat, kernel_size, bias=bias), CAB(n_feat,kernel_size, reduction, bias=bias, act=act))
+        self.stage1_encoder = Encoder(n_feat, kernel_size, reduction, act, bias, scale_unetfeats, csff=False)
+        self.stage1_decoder = Decoder(n_feat, kernel_size, reduction, act, bias, scale_unetfeats)
+        self.sam12 = SAM(n_feat, kernel_size=1, bias=bias)
+
+    def forward(self, label):
+        eps = torch.randn_like(label)
+        fea = self.shallow_feat1(torch.cat([label, eps],dim=1))
+        fea2 = self.stage1_encoder(fea)
+        fea3 = self.stage1_decoder(fea2)
+        _, stage1_img = self.sam12(fea3[0], label) 
+        return stage1_img
+
+
 class _NetD(nn.Module):
-    def __init__(self):
+    def __init__(self, in_channels=6):
         super(_NetD, self).__init__()
         self.features = nn.Sequential(
             # input is (3) x 128 x 128
-            nn.Conv2d(in_channels=6, out_channels=64, kernel_size=5, stride=1, padding=2, bias=True),
+            nn.Conv2d(in_channels=in_channels, out_channels=64, kernel_size=5, stride=1, padding=2, bias=True),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(in_channels=64, out_channels=64, kernel_size=4, stride=2, padding=1, bias=True),            
             nn.LeakyReLU(0.2, inplace=True),

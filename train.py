@@ -31,20 +31,24 @@ import argparse
 import random
 import shutil
 import sys
+import os
 
 import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
+import torchvision
 from torch.utils.data import DataLoader
 from torchvision import transforms
+from torchvision.datasets import Cityscapes
 
 import compressai
 
 from compressai.datasets import ImageFolder
 from compressai.zoo import image_models
-from netext import ScaleHyperpriorExt
+from netext import ScaleHyperpriorExt, MeanScaleHyperpriorWithY
+
+SJOB = os.getenv('SLURM_JOB_ID')
 
 class CropToMod(object):
     def __init__(self, mod):
@@ -139,28 +143,29 @@ def configure_optimizers(net, args):
 
 
 def train_one_epoch(
-    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm
+    G1, criterion, train_dataloader, G1_optimizer, G1_aux_optimizer, epoch, clip_max_norm
 ):
-    model.train()
-    device = next(model.parameters()).device
+    G1.train()
+    device = next(G1.parameters()).device
 
-    for i, d in enumerate(train_dataloader):
+    for i, dd in enumerate(train_dataloader):
+        d, _ = dd
         d = d.to(device)
 
-        optimizer.zero_grad()
-        aux_optimizer.zero_grad()
+        G1_optimizer.zero_grad()
+        G1_aux_optimizer.zero_grad()
 
-        out_net = model(d)
+        out_net = G1(d)
 
         out_criterion = criterion(out_net, d)
         out_criterion["loss"].backward()
         if clip_max_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
-        optimizer.step()
+            torch.nn.utils.clip_grad_norm_(G1.parameters(), clip_max_norm)
+        G1_optimizer.step()
 
-        aux_loss = model.aux_loss()
+        aux_loss = G1.aux_loss()
         aux_loss.backward()
-        aux_optimizer.step()
+        G1_aux_optimizer.step()
 
         if i % 500 == 0:
             print(
@@ -174,25 +179,28 @@ def train_one_epoch(
             )
 
 
-def test_epoch(epoch, test_dataloader, model, criterion):
+def test_epoch(epoch, test_dataloader, model, criterion, img_dir):
     model.eval()
     device = next(model.parameters()).device
-
     loss = AverageMeter()
     bpp_loss = AverageMeter()
     mse_loss = AverageMeter()
     aux_loss = AverageMeter()
-
     with torch.no_grad():
-        for d in test_dataloader:
+        for xi, dd in enumerate(test_dataloader):
+            d, _ = dd
             d = d.to(device)
             out_net = model(d)
             out_criterion = criterion(out_net, d)
-
             aux_loss.update(model.aux_loss())
             bpp_loss.update(out_criterion["bpp_loss"])
             loss.update(out_criterion["loss"])
             mse_loss.update(out_criterion["mse_loss"])
+            if xi<=10 and img_dir != "":
+                with open(img_dir + "/{}_o.jpg".format(xi), 'wb') as f:
+                    torchvision.utils.save_image(d[0], f)
+                with open(img_dir + "/{}_g1.jpg".format(xi), 'wb') as f:
+                    torchvision.utils.save_image(out_net["x_hat"][0], f)
 
     print(
         f"Test epoch {epoch}: Average losses:"
@@ -292,22 +300,26 @@ def parse_args(argv):
 
 
 def main(argv):
-    args = parse_args(argv)
 
+    if not os.path.exists(SJOB):
+        os.makedirs(SJOB)
+
+    args = parse_args(argv)
+    N, M = 128, 192
     if args.seed is not None:
         torch.manual_seed(args.seed)
         random.seed(args.seed)
 
     train_transforms = transforms.Compose(
-        [transforms.RandomCrop(args.patch_size,pad_if_needed=True), transforms.ToTensor()]
+        [transforms.Resize(512), transforms.RandomCrop(args.patch_size,pad_if_needed=True), transforms.ToTensor()]
     )
 
     test_transforms = transforms.Compose(
-        [CropToMod(64), transforms.ToTensor()]
+        [transforms.Resize(512), CropToMod(64), transforms.ToTensor()]
     )
 
-    train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
-    test_dataset = ImageFolder(args.dataset, split="test", transform=test_transforms)
+    train_dataset = Cityscapes(args.dataset, split="train", target_type="semantic", transform=train_transforms, target_transform=train_transforms)
+    test_dataset = Cityscapes(args.dataset, split="val", target_type="semantic", transform=test_transforms, target_transform=test_transforms)
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
@@ -327,15 +339,11 @@ def main(argv):
         pin_memory=(device == "cuda"),
     )
 
-    net = image_models[args.model](quality=1,pretrained=True)
-    # net = ScaleHyperpriorExt()
-    net = net.to(device)
+    G1 = MeanScaleHyperpriorWithY(N,M)
+    G1 = G1.to(device)
 
-    if args.cuda and torch.cuda.device_count() > 1:
-        net = CustomDataParallel(net)
-
-    optimizer, aux_optimizer = configure_optimizers(net, args)
-    lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min")
+    G1_optimizer, G1_aux_optimizer = configure_optimizers(G1, args)
+    lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(G1_optimizer, "min")
     criterion = RateDistortionLoss(lmbda=args.lmbda)
 
     last_epoch = 0
@@ -343,42 +351,35 @@ def main(argv):
         print("Loading", args.checkpoint)
         checkpoint = torch.load(args.checkpoint, map_location=device)
         last_epoch = checkpoint["epoch"] + 1
-        net.load_state_dict(checkpoint["state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
+        G1.load_state_dict(checkpoint["G1_state_dict"])
+        G1_optimizer.load_state_dict(checkpoint["G1_optimizer"])
+        G1_aux_optimizer.load_state_dict(checkpoint["G1_aux_optimizer"])
         lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
 
     best_loss = float("inf")
     for epoch in range(last_epoch, args.epochs):
-        print(f"Learning rate: {optimizer.param_groups[0]['lr']}")
+        print(f"Learning rate: {G1_optimizer.param_groups[0]['lr']}")
         train_one_epoch(
-            net,
+            G1,
             criterion,
             train_dataloader,
-            optimizer,
-            aux_optimizer,
+            G1_optimizer,
+            G1_aux_optimizer,
             epoch,
             args.clip_max_norm,
         )
-        loss = test_epoch(epoch, test_dataloader, net, criterion)
-        lr_scheduler.step(loss)
-
-        is_best = loss < best_loss
-        best_loss = min(loss, best_loss)
-
-        if args.save:
-            save_checkpoint(
-                {
-                    "epoch": epoch,
-                    "state_dict": net.state_dict(),
-                    "loss": loss,
-                    "optimizer": optimizer.state_dict(),
-                    "aux_optimizer": aux_optimizer.state_dict(),
-                    "lr_scheduler": lr_scheduler.state_dict(),
-                },
-                is_best,
-            )
-        
+        if epoch%10==0:
+            CKPT = SJOB + "/ckp_"+str(epoch)+".pth"
+            torch.save({
+                'epoch': epoch,
+                'G1_state_dict': G1.state_dict(),
+                'G1_optimizer': G1_optimizer.state_dict(),
+                'lr_scheduler':lr_scheduler.state_dict()
+            }, CKPT)
+            img_dir = CKPT + "_imgs"
+            if not os.path.exists(img_dir):
+                os.makedirs(img_dir)
+            test_epoch(epoch, test_dataloader, G1, criterion, img_dir) 
 
 if __name__ == "__main__":
     main(sys.argv[1:])

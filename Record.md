@@ -70,3 +70,21 @@
   * 37107_4294967294.out
 * lam 0.025 stochastic gen
   * 37112_4294967294.out
+
+# Basemodel gg18 mean scale
+* lam 0.00125
+* lam 0.0025
+  * 37158_4294967294.out
+  * Bpp loss: 0.06 |	PSNR val: 31.38
+
+# Conmodel gg18 mean scale
+* lam 0.00125
+* lam 0.0025
+
+
+python -u train.py --name oasis_cityscapes --dataset_mode cityscapes --gpu_ids -1 \
+--dataroot /home/JJ_Group/xutd/git/Dataset/cityspace --batch_size 20 --no_EMA --no_3dnoise --no_labelmix
+
+
+
+python -u train.py --name oasis_cityscapes --dataset_mode cityscapes --gpu_ids 0 --dataroot /data/xutd/cityspace --batch_size 20 --no_EMA --no_3dnoise --no_labelmix

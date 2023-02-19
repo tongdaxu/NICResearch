@@ -180,15 +180,34 @@ class ConMeanScaleHyperpriorWithY(MeanScaleHyperprior):
             GDN(N, inverse=True),
         )
         self.g_s2 = nn.Sequential(
-            deconv(N+28, N),
+            deconv(N+34, N),
             GDN(N, inverse=True),
             deconv(N, 3),
         )
+        self.hs_z = nn.Sequential(
+            deconv(N, N),
+            nn.ReLU(inplace=True),
+            deconv(N, N),
+            nn.ReLU(inplace=True),
+        )
+        self.hs_label = nn.Sequential(
+            conv(34, N),
+            nn.ReLU(inplace=True),
+            conv(N, N),
+            nn.ReLU(inplace=True),
+        )
+        self.h_s = nn.Sequential(
+            conv(N*2, M, stride=1, kernel_size=3),
+            nn.ReLU(inplace=True),
+        )
+
     def forward(self, x, label):
         y = self.g_a(x)
         z = self.h_a(y)
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
-        gaussian_params = self.h_s(z_hat)
+        z_ctx = self.hs_z(z_hat)
+        l_ctx = self.hs_label(label)
+        gaussian_params = self.h_s(torch.cat([z_ctx,l_ctx],dim=1))
         scales_hat, means_hat = gaussian_params.chunk(2, 1)
         y_hat, y_likelihoods = self.gaussian_conditional(y, scales_hat, means=means_hat)
         y_hat_i = torch.round(y - means_hat) + means_hat

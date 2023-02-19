@@ -74,12 +74,14 @@
 # Basemodel gg18 mean scale
 * lam 0.00125
 * lam 0.0025
-  * 37158_4294967294.out
+  * 251 37158_4294967294.out
   * Bpp loss: 0.06 |	PSNR val: 31.38
 
 # Conmodel gg18 mean scale
 * lam 0.00125
+  * 20 2023-02-19-06-59-35
 * lam 0.0025
+  * 20 2023-02-19-06-59-53
 
 
 python -u train.py --name oasis_cityscapes --dataset_mode cityscapes --gpu_ids -1 \

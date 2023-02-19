@@ -50,6 +50,10 @@ from netext import ScaleHyperpriorExt, MeanScaleHyperpriorWithY
 
 SJOB = os.getenv('SLURM_JOB_ID')
 
+if SJOB is None:
+    import time
+    SJOB=time.strftime("%Y-%m-%d-%H-%M-%S", time.gmtime())
+
 class CropToMod(object):
     def __init__(self, mod):
         self.mod = mod
@@ -358,7 +362,6 @@ def main(argv):
 
     best_loss = float("inf")
     for epoch in range(last_epoch, args.epochs):
-        print(f"Learning rate: {G1_optimizer.param_groups[0]['lr']}")
         train_one_epoch(
             G1,
             criterion,

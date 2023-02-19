@@ -197,7 +197,7 @@ class ConMeanScaleHyperpriorWithY(MeanScaleHyperprior):
             nn.ReLU(inplace=True),
         )
         self.h_s = nn.Sequential(
-            conv(N*2, M, stride=1, kernel_size=3),
+            conv(N*2, M*2, stride=1, kernel_size=3),
             nn.ReLU(inplace=True),
         )
 

@@ -54,9 +54,13 @@ from compressai.datasets import ImageFolder
 from compressai.zoo import image_models
 from netext import ScaleHyperpriorWithY, ScaleHyperpriorYDecoder, Discriminator, MeanScaleHyperpriorWithY, ConMeanScaleHyperpriorWithY
 from srresnet import _NetG, _NetD, _ConNetG
+
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
+
 SJOB = os.getenv('SLURM_JOB_ID')
 if SJOB is None:
-    SJOB = "00000"
+    import time
+    SJOB=time.strftime("%Y-%m-%d-%H-%M-%S", time.gmtime())
 
 class CropToMod(object):
     def __init__(self, mod):
@@ -150,8 +154,8 @@ def configure_optimizers(net, args):
     return optimizer, aux_optimizer
 
 def train_one_epoch(
-    G1, G2, D, criterion, train_dataloader, G1_optimizer, G1_aux_optimizer, 
-    G2_optimizer, D_optimizer, epoch, clip_max_norm
+    G1, criterion, train_dataloader, G1_optimizer, G1_aux_optimizer, 
+    epoch, clip_max_norm
 ):
     G1.train()
     device = next(G1.parameters()).device
@@ -159,7 +163,7 @@ def train_one_epoch(
         x_, xl_ = xx_
         x_, xl_ = x_.to(device), xl_.to(device) * 255
         xl_ = xl_.to(torch.int64)
-        xl_ = xl_[:,::4,::4]
+        xl_ = xl_[:,:,::4,::4]
         bs, _ , h, w = xl_.size()
         ys_ = torch.zeros(bs, 34, h, w, dtype=xl_.dtype, device=device).scatter_(1, xl_, 1)
         ys_ = ys_.to(device, dtype=torch.float32)
@@ -190,25 +194,41 @@ def train_one_epoch(
                 f"\tAux loss: {aux_loss.item():.2f}"
             )
 
-def test_epoch(epoch, test_dataloader, G1, G2, criterion, img_dir):
+def test_epoch(epoch, test_dataloader, G1, criterion, img_dir):
     G1.eval()
     device = next(G1.parameters()).device
-
+    loss = AverageMeter()
+    bpp_loss = AverageMeter()
+    mse_loss = AverageMeter()
+    aux_loss = AverageMeter()
     with torch.no_grad():
         for xi, xx_ in enumerate(test_dataloader):
             x_, xl_ = xx_
             x_, xl_ = x_.to(device), xl_.to(device) * 255
             xl_ = xl_.to(torch.int64)
-            xl_ = xl_[:,::4,::4]
+            xl_ = xl_[:,:,::4,::4]
             bs, _ , h, w = xl_.size()
             ys_ = torch.zeros(bs, 34, h, w, dtype=xl_.dtype, device=device).scatter_(1, xl_, 1)
             ys_ = ys_.to(device, dtype=torch.float32)
             out_net = G1(x_, ys_)
+            out_criterion = criterion(out_net, x_)
+            aux_loss.update(G1.aux_loss())
+            bpp_loss.update(out_criterion["bpp_loss"])
+            loss.update(out_criterion["loss"])
+            mse_loss.update(out_criterion["mse_loss"])
             if xi<=10 and img_dir != "":
                 with open(img_dir + "/{}_o.jpg".format(xi), 'wb') as f:
                     torchvision.utils.save_image(x_[0], f)
                 with open(img_dir + "/{}_g1.jpg".format(xi), 'wb') as f:
                     torchvision.utils.save_image(out_net["x_hat"][0], f)
+    print(
+        f"Test epoch {epoch}: Average losses:"
+        f"\tLoss: {loss.avg:.3f} |"
+        f"\tMSE loss: {mse_loss.avg:.3f} |"
+        f"\tBpp loss: {bpp_loss.avg:.2f} |"
+        f"\tPSNR val: {10.0*torch.log10(1/mse_loss.avg):.2f} |"
+        f"\tAux loss: {aux_loss.avg:.2f}\n"
+    )
 
 
 def save_checkpoint(state, is_best, filename="checkpoint.pth.tar"):
@@ -297,6 +317,10 @@ def parse_args(argv):
 
 
 def main(argv):
+
+    if not os.path.exists(SJOB):
+        os.makedirs(SJOB)
+
     N, M = 128, 192
     args = parse_args(argv)
 
@@ -334,7 +358,7 @@ def main(argv):
     )
 
 
-    G1 = MeanScaleHyperpriorWithY(N,M)
+    G1 = ConMeanScaleHyperpriorWithY(N,M)
     G1 = G1.to(device)
 
     G1_optimizer, G1_aux_optimizer = configure_optimizers(G1, args)
@@ -352,7 +376,6 @@ def main(argv):
         lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
 
     for epoch in range(last_epoch, args.epochs):
-        print(f"Learning rate: {G1_optimizer.param_groups[0]['lr']}")
         train_one_epoch(
             G1,
             criterion,

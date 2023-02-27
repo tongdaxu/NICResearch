@@ -11,4 +11,4 @@
 # 中间不可以有非 #SBATCH 开头的行
 # 执行 sbatch 命令前先通过 conda activate [env_name] 进入环境
 
-python -u train_con.py -d /home/JJ_Group/xutd/git/Dataset/cityspace --epochs 1000 -lr 1e-4 --batch-size 16 --test-batch-size 1 --lambda 0.00125 --cuda --save
+python -u train_con.py -d /data/xutd/cityspace --epochs 1000 -lr 1e-4 --batch-size 16 --test-batch-size 1 --lambda 0.00125 --cuda --save

@@ -2,6 +2,7 @@ from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from compressai.ops import LowerBound
 from compressai.entropy_models import GaussianConditional
@@ -173,46 +174,88 @@ class MeanScaleHyperpriorWithY(MeanScaleHyperprior):
 class ConMeanScaleHyperpriorWithY(MeanScaleHyperprior):
     def __init__(self, N, M, **kwargs):
         super().__init__(N=N, M=M, **kwargs)
-        self.g_s1 = nn.Sequential(
-            deconv(M, N),
-            GDN(N, inverse=True),
-            deconv(N, N),
-            GDN(N, inverse=True),
+
+        self.g_a_1 = nn.Sequential(
+            conv(3+34, N),
+            GDN(N)
         )
-        self.g_s2 = nn.Sequential(
+        self.g_a_2 = nn.Sequential(
+            conv(N+34, N),
+            GDN(N),
+        )
+        self.g_a_3 =  nn.Sequential(
+            conv(N+34, N),
+            GDN(N)
+        )
+        self.g_a_4 = nn.Sequential(
+            conv(N+34, M),
+        )
+        self.g_s_1 = nn.Sequential(
+            deconv(M+34, N),
+            GDN(N, inverse=True)
+        )
+        self.g_s_2 = nn.Sequential(
             deconv(N+34, N),
-            GDN(N, inverse=True),
-            deconv(N, 3),
+            GDN(N, inverse=True)
         )
-        self.hs_z = nn.Sequential(
-            deconv(N, N),
-            nn.ReLU(inplace=True),
-            deconv(N, N),
-            nn.ReLU(inplace=True),
+        self.g_s_3 = nn.Sequential(
+            deconv(N+34, N),
+            GDN(N, inverse=True)
         )
-        self.hs_label = nn.Sequential(
-            conv(34, N),
-            nn.ReLU(inplace=True),
+        self.g_s_4 = nn.Sequential(
+            deconv(N+34, 3),
+        )
+        self.h_a_1 = nn.Sequential(
+            conv(M+34, N, stride=1, kernel_size=3),
+            nn.LeakyReLU(inplace=True),
             conv(N, N),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(inplace=True)
         )
-        self.h_s = nn.Sequential(
-            conv(N*2, M*2, stride=1, kernel_size=3),
-            nn.ReLU(inplace=True),
+        self.h_a_2 = nn.Sequential(
+            conv(N+34, N),
+        )
+        self.h_s_1 = nn.Sequential(
+            deconv(N+34, M),
+            nn.LeakyReLU(inplace=True)
+        )
+        self.h_s_2 =  nn.Sequential(
+            deconv(M+34, M * 3 // 2),
+            nn.LeakyReLU(inplace=True),
+            conv(M * 3 // 2, M * 2, stride=1, kernel_size=3),
         )
 
     def forward(self, x, label):
-        y = self.g_a(x)
-        z = self.h_a(y)
+
+        label_1 = F.interpolate(label, scale_factor=8)
+        label_2 = F.interpolate(label, scale_factor=4)
+        label_4 = F.interpolate(label, scale_factor=2)
+        label_8 = label
+        label_16 = F.interpolate(label, scale_factor=1/2)
+        label_32 = F.interpolate(label, scale_factor=1/4)
+        label_64 = F.interpolate(label, scale_factor=1/8)
+
+        y = self.g_a_1(torch.cat([x,label_1],dim=1))
+        y = self.g_a_2(torch.cat([y,label_2],dim=1))
+        y = self.g_a_3(torch.cat([y,label_4],dim=1))
+        y = self.g_a_4(torch.cat([y,label_8],dim=1))
+
+        z = self.h_a_1(torch.cat([y,label_16],dim=1))
+        z = self.h_a_2(torch.cat([z,label_32],dim=1))
+
         z_hat, z_likelihoods = self.entropy_bottleneck(z)
-        z_ctx = self.hs_z(z_hat)
-        l_ctx = self.hs_label(label)
-        gaussian_params = self.h_s(torch.cat([z_ctx,l_ctx],dim=1))
+
+        gaussian_params = self.h_s_1(torch.cat([z_hat,label_64],dim=1))
+        gaussian_params = self.h_s_2(torch.cat([gaussian_params,label_32],dim=1))
+
         scales_hat, means_hat = gaussian_params.chunk(2, 1)
         y_hat, y_likelihoods = self.gaussian_conditional(y, scales_hat, means=means_hat)
         y_hat_i = torch.round(y - means_hat) + means_hat
-        x_mid = self.g_s1(y_hat)
-        x_hat = self.g_s2(torch.cat([x_mid,label],dim=1))
+
+        x_hat = self.g_s_1(torch.cat([y_hat, label_16],dim=1))
+        x_hat = self.g_s_2(torch.cat([x_hat, label_8],dim=1))
+        x_hat = self.g_s_3(torch.cat([x_hat, label_4],dim=1))
+        x_hat = self.g_s_4(torch.cat([x_hat, label_2],dim=1))
+
         return {
             "x_hat": x_hat,
             "y_hat": y_hat.detach(), # get the aun bitstream

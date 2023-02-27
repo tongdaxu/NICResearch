@@ -266,7 +266,7 @@ def test_epoch(epoch, test_dataloader, G1, G2, criterion, img_dir):
             loss.update(out_criterion["loss"])
             mse_loss.update(out_criterion["mse_loss"])
             mse2_loss.update(g2_mse)
-            if xi<=10 and img_dir != "":
+            if img_dir != "":
                 with open(img_dir + "/{}_o.jpg".format(xi), 'wb') as f:
                     torchvision.utils.save_image(x_[0], f)
                 with open(img_dir + "/{}_g1.jpg".format(xi), 'wb') as f:
@@ -467,8 +467,23 @@ def main(argv):
             if not os.path.exists(img_dir):
                 os.makedirs(img_dir)
             test_epoch(epoch, test_dataloader, G1, G2, criterion, img_dir)
-        # else:
-        #     test_epoch(epoch, test_dataloader, G1, G2, criterion, "")
+        # test for last epoch
+        CKPT = SJOB + "/ckp_"+str(epoch)+".pth"
+        torch.save({
+            'epoch': epoch,
+            'G1_state_dict': G1.state_dict(),
+            'G2_state_dict': G2.state_dict(),
+            'D_state_dict': D.state_dict(),
+            'G1_optimizer': G1_optimizer.state_dict(),
+            'G1_aux_optimizer': G1_aux_optimizer.state_dict(),
+            'G2_optimizer': G2_optimizer.state_dict(),
+            'D_optimizer': D_optimizer.state_dict(),
+            'lr_scheduler':lr_scheduler.state_dict()
+        }, CKPT)
+        img_dir = CKPT + "_imgs"
+        if not os.path.exists(img_dir):
+            os.makedirs(img_dir)
+        test_epoch(epoch, test_dataloader, G1, G2, criterion, img_dir)
 
 if __name__ == "__main__":
     main(sys.argv[1:])

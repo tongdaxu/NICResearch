@@ -41,14 +41,17 @@ import torchvision
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.datasets import Cityscapes
+from torchvision.transforms.functional import InterpolationMode
 
 import compressai
 
 from compressai.datasets import ImageFolder
 from compressai.zoo import image_models
 from netext import ScaleHyperpriorExt, MeanScaleHyperpriorWithY
+from datasetext import CityscapesDataset
 
 SJOB = os.getenv('SLURM_JOB_ID')
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
 
 if SJOB is None:
     import time
@@ -147,14 +150,17 @@ def configure_optimizers(net, args):
 
 
 def train_one_epoch(
-    G1, criterion, train_dataloader, G1_optimizer, G1_aux_optimizer, epoch, clip_max_norm
+    G1, criterion, train_dataloader, G1_optimizer, G1_aux_optimizer, epoch, clip_max_norm, patch_size
 ):
     G1.train()
     device = next(G1.parameters()).device
 
     for i, dd in enumerate(train_dataloader):
-        d, _ = dd
+        d, _, _ = dd
         d = d.to(device)
+        bs, _, h, w = d.size()
+        cx, cy = random.randint(0, h-patch_size[0]), random.randint(0, w-patch_size[1])
+        d = d[:,:,cx:cx+patch_size[0],cy:cy+patch_size[1]]
 
         G1_optimizer.zero_grad()
         G1_aux_optimizer.zero_grad()
@@ -176,10 +182,10 @@ def train_one_epoch(
                 f"Train epoch {epoch}: ["
                 f"{i*len(d)}/{len(train_dataloader.dataset)}"
                 f" ({100. * i / len(train_dataloader):.0f}%)]"
-                f'\tLoss: {out_criterion["loss"].item():.3f} |'
-                f'\tMSE loss: {out_criterion["mse_loss"].item():.3f} |'
-                f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
-                f"\tAux loss: {aux_loss.item():.2f}"
+                f'\tLoss: {out_criterion["loss"].item():.6f} |'
+                f'\tMSE loss: {out_criterion["mse_loss"].item():.6f} |'
+                f'\tBpp loss: {out_criterion["bpp_loss"].item():.6f} |'
+                f"\tAux loss: {aux_loss.item():.6f}"
             )
 
 
@@ -192,7 +198,7 @@ def test_epoch(epoch, test_dataloader, model, criterion, img_dir):
     aux_loss = AverageMeter()
     with torch.no_grad():
         for xi, dd in enumerate(test_dataloader):
-            d, _ = dd
+            d, _, xname = dd
             d = d.to(device)
             out_net = model(d)
             out_criterion = criterion(out_net, d)
@@ -200,19 +206,21 @@ def test_epoch(epoch, test_dataloader, model, criterion, img_dir):
             bpp_loss.update(out_criterion["bpp_loss"])
             loss.update(out_criterion["loss"])
             mse_loss.update(out_criterion["mse_loss"])
-            if xi<=10 and img_dir != "":
-                with open(img_dir + "/{}_o.jpg".format(xi), 'wb') as f:
+            if img_dir != "":
+                xname = xname[0]
+                xname = xname.split('/')[1]
+                with open(img_dir + "/{}_ori.jpg".format(xname), 'wb') as f:
                     torchvision.utils.save_image(d[0], f)
-                with open(img_dir + "/{}_g1.jpg".format(xi), 'wb') as f:
+                with open(img_dir + "/{}_rec.jpg".format(xname), 'wb') as f:
                     torchvision.utils.save_image(out_net["x_hat"][0], f)
 
     print(
         f"Test epoch {epoch}: Average losses:"
-        f"\tLoss: {loss.avg:.3f} |"
-        f"\tMSE loss: {mse_loss.avg:.3f} |"
-        f"\tBpp loss: {bpp_loss.avg:.2f} |"
-        f"\tPSNR val: {10.0*torch.log10(1/mse_loss.avg):.2f} |"
-        f"\tAux loss: {aux_loss.avg:.2f}\n"
+        f"\tLoss: {loss.avg:.6f} |"
+        f"\tMSE loss: {mse_loss.avg:.6f} |"
+        f"\tBpp loss: {bpp_loss.avg:.6f} |"
+        f"\tPSNR val: {10.0*torch.log10(1/mse_loss.avg):.6f} |"
+        f"\tAux loss: {aux_loss.avg:.6f}\n"
     )
 
     return loss.avg
@@ -254,7 +262,7 @@ def parse_args(argv):
         "-n",
         "--num-workers",
         type=int,
-        default=4,
+        default=16,
         help="Dataloaders threads (default: %(default)s)",
     )
     parser.add_argument(
@@ -314,16 +322,8 @@ def main(argv):
         torch.manual_seed(args.seed)
         random.seed(args.seed)
 
-    train_transforms = transforms.Compose(
-        [transforms.Resize(512), transforms.RandomCrop(args.patch_size,pad_if_needed=True), transforms.ToTensor()]
-    )
-
-    test_transforms = transforms.Compose(
-        [transforms.Resize(512), CropToMod(64), transforms.ToTensor()]
-    )
-
-    train_dataset = Cityscapes(args.dataset, split="train", target_type="semantic", transform=train_transforms, target_transform=train_transforms)
-    test_dataset = Cityscapes(args.dataset, split="val", target_type="semantic", transform=test_transforms, target_transform=test_transforms)
+    train_dataset = CityscapesDataset(args.dataset, mode="train")
+    test_dataset = CityscapesDataset(args.dataset, mode="val")
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
 
@@ -333,6 +333,7 @@ def main(argv):
         num_workers=args.num_workers,
         shuffle=True,
         pin_memory=(device == "cuda"),
+        persistent_workers=True
     )
 
     test_dataloader = DataLoader(
@@ -341,6 +342,7 @@ def main(argv):
         num_workers=args.num_workers,
         shuffle=False,
         pin_memory=(device == "cuda"),
+        persistent_workers=True
     )
 
     G1 = MeanScaleHyperpriorWithY(N,M)
@@ -370,19 +372,35 @@ def main(argv):
             G1_aux_optimizer,
             epoch,
             args.clip_max_norm,
+            args.patch_size
         )
         if epoch%10==0:
-            CKPT = SJOB + "/ckp_"+str(epoch)+".pth"
-            torch.save({
-                'epoch': epoch,
-                'G1_state_dict': G1.state_dict(),
-                'G1_optimizer': G1_optimizer.state_dict(),
-                'lr_scheduler':lr_scheduler.state_dict()
-            }, CKPT)
-            img_dir = CKPT + "_imgs"
-            if not os.path.exists(img_dir):
-                os.makedirs(img_dir)
-            test_epoch(epoch, test_dataloader, G1, criterion, img_dir) 
+            if epoch%100==0:
+                CKPT = SJOB + "/ckp_"+str(epoch)+".pth"
+                torch.save({
+                    'epoch': epoch,
+                    'G1_state_dict': G1.state_dict(),
+                    'G1_optimizer': G1_optimizer.state_dict(),
+                    'lr_scheduler':lr_scheduler.state_dict()
+                }, CKPT)
+                img_dir = CKPT + "_imgs"
+                if not os.path.exists(img_dir):
+                    os.makedirs(img_dir)
+                test_epoch(epoch, test_dataloader, G1, criterion, img_dir)
+            else:
+                test_epoch(epoch, test_dataloader, G1, criterion, "")
+    CKPT = SJOB + "/ckp_"+str(epoch)+".pth"
+    torch.save({
+        'epoch': epoch,
+        'G1_state_dict': G1.state_dict(),
+        'G1_optimizer': G1_optimizer.state_dict(),
+        'lr_scheduler':lr_scheduler.state_dict()
+    }, CKPT)
+    img_dir = CKPT + "_imgs"
+    if not os.path.exists(img_dir):
+        os.makedirs(img_dir)
+    test_epoch(epoch, test_dataloader, G1, criterion, img_dir)
+
 
 if __name__ == "__main__":
     main(sys.argv[1:])
